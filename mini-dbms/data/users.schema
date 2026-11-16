@@ -1,0 +1,4 @@
+# users 테이블 정의 — 첫 컬럼은 항상 id INT (자동 부여)
+id INT
+name TEXT
+age INT
