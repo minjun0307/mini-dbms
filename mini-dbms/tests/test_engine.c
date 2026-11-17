@@ -198,7 +198,10 @@ static void test_index_matches_full_scan(void) {
                 expected += m;
             }
             CHECK_INT(r.nrows, expected);
-            CHECK_INT(r.used_index, o != 5);  /* != 는 인덱스로 이득이 없어 풀 스캔 */
+            /* = 는 항상 인덱스, != 는 항상 풀 스캔,
+             * 범위 조건은 결과가 전체의 index_range_max_ratio 이하일 때만 인덱스 */
+            int want_index = o == 0 || (o != 5 && (double)expected / 300 <= index_range_max_ratio);
+            CHECK_INT(r.used_index, want_index);
             int sorted = 1;
             for (long long i = 1; i < r.nrows; i++)
                 if (r.cells[i].i <= r.cells[i - 1].i) sorted = 0;
@@ -218,6 +221,73 @@ static void test_index_matches_full_scan(void) {
     result_free(&r);
     CHECK_INT(exec1(db, "SELECT id FROM users WHERE age = 0", &r), 0);
     CHECK_INT(r.nrows, 17);  /* 17, 34, ..., 289 */
+    result_free(&r);
+    cleanup(db);
+}
+
+static void test_range_plan_by_ratio(void) {
+    /* 범위 조건: 예상 결과 비율이 기준(14%) 이하이면 인덱스, 넘으면 풀 스캔. 결과는 같아야 한다 */
+    DB *db = fresh_db();
+    SBuf sql;
+    sb_init(&sql);
+    sb_puts(&sql, "INSERT INTO users VALUES ");
+    for (int i = 1; i <= 1000; i++) sb_printf(&sql, "%s('u%d', %d)", i > 1 ? ", " : "", i, i % 50);
+    Result r;
+    CHECK_INT(exec1(db, sql.data, &r), 0);
+    result_free(&r);
+    sb_free(&sql);
+
+    /* 1000 행 중 140 행(14%) → 기준 이하 → 인덱스 */
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id > 860", &r), 0);
+    CHECK_INT(r.nrows, 140);
+    CHECK_INT(r.used_index, 1);
+    CHECK_INT(r.examined, 140);
+    CHECK_CONTAINS(r.plan, "INDEX RANGE SCAN");
+    CHECK_CONTAINS(r.plan, "est. 14.0%");
+    result_free(&r);
+
+    /* 141 행(14.1%) → 기준 초과 → 풀 스캔 */
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id >= 860", &r), 0);
+    CHECK_INT(r.nrows, 141);
+    CHECK_INT(r.used_index, 0);
+    CHECK_INT(r.examined, 1000);
+    CHECK_CONTAINS(r.plan, "FULL SCAN");
+    CHECK_CONTAINS(r.plan, "est. 14.1%");
+    if (r.nrows == 141) CHECK_INT(r.cells[0].i, 860);
+    result_free(&r);
+
+    /* < 와 <= 도 같은 기준: 1..140 은 인덱스, 1..141 은 풀 스캔 */
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id <= 140", &r), 0);
+    CHECK_INT(r.nrows, 140);
+    CHECK_INT(r.used_index, 1);
+    result_free(&r);
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id < 142", &r), 0);
+    CHECK_INT(r.nrows, 141);
+    CHECK_INT(r.used_index, 0);
+    result_free(&r);
+
+    /* 전체가 나오는 범위라도 LIMIT 이 작으면 인덱스가 그만큼만 읽고 멈춘다 */
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id >= 1 LIMIT 10", &r), 0);
+    CHECK_INT(r.nrows, 10);
+    CHECK_INT(r.used_index, 1);
+    CHECK_INT(r.examined, 10);
+    result_free(&r);
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id >= 1", &r), 0);
+    CHECK_INT(r.nrows, 1000);
+    CHECK_INT(r.used_index, 0);
+    result_free(&r);
+
+    /* 범위 밖 → 예상 0 행 → 인덱스로 바로 끝 */
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id > 1000", &r), 0);
+    CHECK_INT(r.nrows, 0);
+    CHECK_INT(r.used_index, 1);
+    CHECK_INT(r.examined, 0);
+    result_free(&r);
+
+    /* = 는 비율과 상관없이 항상 인덱스 */
+    CHECK_INT(exec1(db, "SELECT id FROM users WHERE id = 500", &r), 0);
+    CHECK_INT(r.used_index, 1);
+    CHECK_CONTAINS(r.plan, "INDEX LOOKUP");
     result_free(&r);
     cleanup(db);
 }
@@ -418,6 +488,7 @@ void engine_tests(void) {
     RUN_TEST(test_multi_row_insert_is_atomic);
     RUN_TEST(test_special_strings_roundtrip);
     RUN_TEST(test_index_matches_full_scan);
+    RUN_TEST(test_range_plan_by_ratio);
     RUN_TEST(test_limit);
     RUN_TEST(test_persistence_and_next_id);
     RUN_TEST(test_recovery_partial_last_line);
