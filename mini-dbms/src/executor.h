@@ -46,6 +46,13 @@ typedef struct {
     double elapsed_ms;
 } Result;
 
+/* [옵티마이저] id 범위 조건(<, <=, >, >=)의 예상 결과가 전체 행의 이 비율을 넘으면
+ * B+ 트리 대신 풀 스캔을 쓴다. 근거: 100만 건·10만 건 측정에서 결과가 약 14% 를 넘으면
+ * 풀 스캔이 더 빨랐다 (인덱스는 행마다 seek + 한 줄 읽기 ≈ 0.6 µs, 풀 스캔은 순차 읽기 ≈ 0.09 µs).
+ * 측정 방법: ./build/bench 의 [5] 항목 (bench 는 측정을 위해 이 값을 1.0 으로 바꿔 인덱스를 강제한다).
+ * 기본값 0.14. 쿼리 실행 중에는 읽기만 하므로, 바꾸려면 쿼리를 실행하기 전에 바꾼다. */
+extern double index_range_max_ratio;
+
 /* dir 안의 모든 *.schema 를 찾아 테이블을 연다 (복구 + 인덱스 재구축 포함) */
 DB *db_open(const char *dir, char *err, size_t errlen);
 void db_close(DB *db);

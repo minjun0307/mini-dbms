@@ -9,6 +9,8 @@
  *      SELECT * FROM users WHERE id = k            → B+ 트리
  *      SELECT * FROM users WHERE name = 'user_k'   → 선형 탐색 (풀 스캔)
  *    결과가 같은지 확인하고 시간을 비교한다.
+ * 4) 범위 검색과 인덱스 없는 컬럼 검색
+ * 5) 결과 비율별로 인덱스 범위 검색 vs 풀 스캔을 재서 옵티마이저 기준값의 근거를 보인다
  */
 #include <errno.h>
 #include <stdio.h>
@@ -67,6 +69,85 @@ static const char *commas(long long v, char *buf) {  /* 1234567 → "1,234,567" 
 static void die(const char *msg) {
     fprintf(stderr, "bench: %s\n", msg);
     exit(1);
+}
+
+static double best_of(DB *db, const char *q, int reps, Capture *out) {
+    double best = 1e18;
+    for (int i = 0; i < reps; i++) {
+        Capture c = {0};
+        db_execute_script(db, q, capture, &c);
+        if (c.errors) die(c.err);
+        if (c.ms < best) best = c.ms;
+        *out = c;
+    }
+    return best;
+}
+
+/* 5) 옵티마이저 기준값(index_range_max_ratio)의 근거: 결과 비율별 인덱스 범위 검색 vs 풀 스캔.
+ * 같은 행 집합을 두 방법으로 고른다.
+ *   WHERE id > X  → B+ 트리 범위 검색 (측정 동안 기준값을 1.0 으로 올려 인덱스를 강제)
+ *   WHERE k  > X  → 풀 스캔 (k 는 id 와 같은 값을 넣은, 인덱스 없는 컬럼) */
+static void bench_range_ratio(const char *dir, long long n, int batch) {
+    char path[512], err[ERR_MAX], a[32];
+    snprintf(path, sizeof path, "%s/ranges.schema", dir);
+    FILE *fp = fopen(path, "w");
+    if (!fp) die("cannot write schema");
+    fputs("id INT\nk INT\nname TEXT\nage INT\nemail TEXT\n", fp);
+    fclose(fp);
+    snprintf(path, sizeof path, "%s/ranges.tbl", dir);
+    unlink(path);
+    DB *db = db_open(dir, err, sizeof err);
+    if (!db) die(err);
+
+    SBuf sql;
+    sb_init(&sql);
+    Capture ins = {0};
+    for (long long start = 1; start <= n; start += batch) {
+        long long end = start + batch - 1 < n ? start + batch - 1 : n;
+        sb_reset(&sql);
+        sb_puts(&sql, "INSERT INTO ranges (k, name, age, email) VALUES ");
+        for (long long i = start; i <= end; i++)
+            sb_printf(&sql, "%s(%lld, 'user_%lld', %lld, 'user_%lld@example.com')",
+                      i == start ? "" : ", ", i, i, 18 + (i * 7) % 60, i);
+        sb_puts(&sql, ";");
+        db_execute_script(db, sql.data, capture, &ins);
+        if (ins.errors) die(ins.err);
+    }
+    sb_free(&sql);
+
+    double saved = index_range_max_ratio;
+    double pct[] = {1, 5, 10, 12, 14, 16, 20, 50, 100};
+    double crossover = -1;
+    printf("\n[5] Range query: index vs full scan by result size (best of 3, SELECT *)\n");
+    printf("    %8s %12s %12s %12s %8s   %s\n", "result", "rows", "index ms", "scan ms", "faster",
+           "optimizer picks");
+    for (size_t i = 0; i < sizeof pct / sizeof pct[0]; i++) {
+        long long x = n - (long long)(n * pct[i] / 100.0);
+        char q[160];
+        Capture ci, cs, co = {0};
+        index_range_max_ratio = 1.0;  /* 인덱스 강제 */
+        snprintf(q, sizeof q, "SELECT * FROM ranges WHERE id > %lld;", x);
+        double ti = best_of(db, q, 3, &ci);
+        index_range_max_ratio = saved;
+        db_execute_script(db, q, capture, &co);  /* 기본 기준값이면 무엇을 고르는지 */
+        snprintf(q, sizeof q, "SELECT * FROM ranges WHERE k > %lld;", x);
+        double ts = best_of(db, q, 3, &cs);
+        if (ci.nrows != cs.nrows || !ci.used_index || cs.used_index) die("range benchmark: plan or result mismatch");
+        if (crossover < 0 && ts < ti) crossover = pct[i];
+        printf("    %7.0f%% %12s %12.2f %12.2f %8s   %s\n", pct[i], commas(ci.nrows, a), ti, ts,
+               ti <= ts ? "index" : "scan", co.used_index ? "index" : "full scan");
+    }
+    index_range_max_ratio = saved;
+    if (crossover > 0)
+        printf("    => full scan wins from about %.0f%% of rows (optimizer threshold: %.0f%%)\n",
+               crossover, saved * 100.0);
+    else
+        printf("    => index won at every measured size (optimizer threshold: %.0f%%)\n", saved * 100.0);
+    db_close(db);
+    /* 다음 실행의 [1]·[2] 측정에 섞이지 않도록 측정용 테이블은 지운다 */
+    unlink(path);
+    snprintf(path, sizeof path, "%s/ranges.schema", dir);
+    unlink(path);
 }
 
 int main(int argc, char **argv) {
@@ -200,5 +281,6 @@ int main(int argc, char **argv) {
     printf("    WHERE age = 30          %8.3f ms  %s rows  (%s)\n", cr2.ms, commas(cr2.nrows, b), cr2.plan);
 
     db_close(db);
+    bench_range_ratio(dir, n, batch);
     return 0;
 }

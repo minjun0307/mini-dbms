@@ -233,6 +233,26 @@ static void exec_insert(DB *db, const Statement *st, Result *r) {
 
 /* ---------- SELECT ---------- */
 
+double index_range_max_ratio = 0.14;
+
+/* id 범위 조건의 결과 행 수를 데이터를 읽지 않고 계산한다.
+ * id 는 1 씩 늘어나며 빈틈이 없다(append-only, 삭제 없음) → [가장 작은 id, 가장 작은 id + 행 수 - 1] */
+static long long estimate_id_range_rows(const Table *t, CmpOp op, long long k) {
+    BPIter it;
+    bpt_first(t->index, &it);
+    if (!bpt_iter_valid(&it)) return 0;
+    long long lo = bpt_iter_key(&it), hi = lo + (long long)t->index->size - 1;
+    long long from = lo, to = hi;
+    switch (op) {
+    case OP_LT: if (k <= lo) return 0; if (k - 1 < hi) to = k - 1; break;
+    case OP_LE: if (k < lo) return 0; if (k < hi) to = k; break;
+    case OP_GT: if (k >= hi) return 0; if (k + 1 > lo) from = k + 1; break;
+    case OP_GE: if (k > hi) return 0; if (k > lo) from = k; break;
+    default: return 1;
+    }
+    return to - from + 1;
+}
+
 static void exec_select(DB *db, const Statement *st, Result *r) {
     Table *t = db_find_table(db, st->table);
     if (!t) {
@@ -290,6 +310,18 @@ static void exec_select(DB *db, const Statement *st, Result *r) {
         pthread_rwlock_unlock(&t->lock);
         set_error(r, st->line, "%s", err);
         return;
+    }
+
+    /* [옵티마이저] 범위 조건은 결과가 많으면 풀 스캔이 더 빠르다 → 예상 결과 비율로 고른다.
+     * LIMIT 이 있으면 인덱스는 그만큼만 읽고 멈추므로 예상 결과를 LIMIT 으로 줄여서 본다. */
+    char why[96] = "";
+    if (use_index && st->where_op != OP_EQ && t->index->size > 0) {
+        long long est = estimate_id_range_rows(t, st->where_op, st->where_val.i);
+        if (limit >= 0 && limit < est) est = limit;
+        double ratio = (double)est / (double)t->index->size;
+        if (ratio > index_range_max_ratio) use_index = 0;
+        snprintf(why, sizeof why, " [optimizer: est. %.1f%% of rows %s %.0f%%]",
+                 ratio * 100.0, use_index ? "<=" : ">", index_range_max_ratio * 100.0);
     }
 
     if (use_index) {
@@ -351,6 +383,8 @@ static void exec_select(DB *db, const Statement *st, Result *r) {
             row_free(sc, row);
         }
     }
+
+    if (why[0]) strncat(r->plan, why, sizeof r->plan - strlen(r->plan) - 1);
 
     reader_close(&rd);
     pthread_rwlock_unlock(&t->lock);
